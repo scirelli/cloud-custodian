@@ -21,14 +21,18 @@ log = logging.getLogger('salactus.acl')
 
 
 class Groups(object):
-
+    """
+    Groups Class
+    """
     AllUsers = "http://acs.amazonaws.com/groups/global/AllUsers"
     AuthenticatedUsers = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers"
     LogDelivery = 'http://acs.amazonaws.com/groups/s3/LogDelivery'
 
 
 class Permissions(object):
-
+    """
+    Permissions
+    """
     FullControl = 'FULL_CONTROL'
     Write = 'WRITE'
     WriteAcp = 'WRITE_ACP'
@@ -37,19 +41,22 @@ class Permissions(object):
 
 
 class ObjectAclCheck(object):
-
     def __init__(self, data, record_users=False):
         self.data = data
         self.whitelist_accounts = set(data.get('whitelist-accounts', ()))
         self.record_users = record_users
 
     def process_key(self, client, bucket_name, key):
+        """
+        process_key
+        """
         acl = client.get_object_acl(Bucket=bucket_name, Key=key['Key'])
         acl.pop('ResponseMetadata')
         grants = self.check_grants(acl)
 
         if not grants:
             return False
+
         if self.data.get('report-only'):
             return {'key': key['Key'], 'grants': grants}
 
@@ -57,8 +64,10 @@ class ObjectAclCheck(object):
         return {'key': key['Key'], 'grants': grants}
 
     def process_version(self, client, bucket_name, key):
-        acl = client.get_object_acl(
-            Bucket=bucket_name, Key=key['Key'], VersionId=key['VersionId'])
+        """
+        process_version
+        """
+        acl = client.get_object_acl(Bucket=bucket_name, Key=key['Key'], VersionId=key['VersionId'])
         acl.pop('ResponseMetadata')
         grants = self.check_grants(acl)
 
@@ -78,6 +87,9 @@ class ObjectAclCheck(object):
         return result
 
     def record_users(self, acl):
+        """
+        record_users
+        """
         users = {}
         users[acl['Owner']['DisplayName']] = acl['Owner']['ID']
         for g in acl.get('Grants'):
@@ -88,6 +100,9 @@ class ObjectAclCheck(object):
         connection.hmset('bucket-user', users)
 
     def check_grants(self, acl):
+        """
+        check_grants
+        """
         owner = acl['Owner']['ID']
         found = []
         for grant in acl.get('Grants', ()):

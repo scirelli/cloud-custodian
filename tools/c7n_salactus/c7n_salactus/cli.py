@@ -24,6 +24,8 @@ import logging
 import operator
 import time
 
+from six import string_types
+
 import click
 import jsonschema
 
@@ -35,8 +37,9 @@ import tabulate
 
 from c7n.config import Bag
 from c7n import utils
-from c7n_salactus import worker, db
 
+from c7n_salactus import worker, db
+import c7n_salactus.settings as appConfig
 # side-effect serialization patches...
 try:
     from c7n_salactus import rqworker # NOQA F401
@@ -64,9 +67,50 @@ CONFIG_SCHEMA = {
             }
         },
 
+        'classify': {
+            'type': 'object',
+            'required': ['type', 'info-types'],
+            'properties': {
+                # specifying a template will override all other config
+                'inspect-template': {'type': 'string'},
+                'project': {'type': 'string', 'title': 'qualified project path'},
+                'min-likelihood': {'enum': [
+                    'LIKELIHOOD_UNSPECIFIED', 'VERY_UNLIKELY',
+                    'UNLIKELY', 'POSSIBLE', 'LIKELY',
+                    'VERY_LIKELY']},
+                'include-quote': {'type': 'boolean', 'default': False},
+                'max-findings-by-item': {'type': 'integer', 'default': 10},
+                'max-findings-by-type': {'type': 'integer', 'default': 10},
+                # https://cloud.google.com/dlp/docs/infotypes-reference
+                'info-types': {'type': 'array', 'items': {'type': 'string'}},
+                # TODO: unconfigured content-options, custom info types, exclude info types.
+            },
+        },
+
+        'object-filters': {
+            'type': 'object',
+            'properties': {
+                'min-size': {'type': 'float'},
+                'max-size': {'type': 'float'},
+                'latest': {'type': 'boolean'},
+                # modified within the last n days
+                'last-modified': {'type': 'float'},
+                'extensions': {'type': 'array', 'items': {'type': 'string'}},
+                'multipart': {'type': 'boolean'},
+                'replication': {'type': 'array', 'items': {
+                    'enum': ['PENDING', 'COMPLETED', 'FAILED', 'REPLICA', '']}},
+                'encryption': {'type': 'array', 'items': {
+                    'enum': ['SSE-S3', 'SSE-C', 'SSE-KMS', 'NOT-SSE']}},
+            },
+        },
+
+
         'inventory': {
             'type': 'object',
             'properties': {
+                'object-filters': {'$ref': '#/definitions/object-filters'},
+                'sample': {'type': 'float',
+                           'title': 'sample percent of objects from the bucket'},
                 'role': {
                     'description': "".join([
                         'The role to assume when loading inventory data ',
@@ -110,7 +154,8 @@ CONFIG_SCHEMA = {
             'type': 'object',
             'oneOf': [
                 {'$ref': '#/definitions/object-acl'},
-                {'$ref': '#/definitions/encrypt-keys'}
+                {'$ref': '#/definitions/encrypt-keys'},
+                {'$ref': '#/definitions/classify'}
             ],
         },
 
@@ -149,9 +194,12 @@ def debug(f):
         try:
             f(*args, **kw)
         except (SystemExit, KeyboardInterrupt):
+            logging.info('Exiting')
             raise
         except Exception:
-            import traceback, sys, pdb
+            import traceback
+            import sys
+            import pdb
             traceback.print_exc()
             pdb.post_mortem(sys.exc_info()[-1])
     functools.update_wrapper(_f, f)
@@ -175,49 +223,41 @@ def validate(config):
 @cli.command()
 @click.option('--config', help='config file for accounts/buckets', type=click.Path())
 @click.option('--tag', help='filter accounts by tag')
-@click.option('--account', '-a',
-              help='scan only the given accounts', multiple=True)
-@click.option('--bucket', '-b',
-              help='scan only the given buckets', multiple=True)
-@click.option('--not-account',
-              help='exclude the given accounts from scan', multiple=True)
-@click.option('--not-bucket',
-              help='exclude the given buckets from scan', multiple=True)
-@click.option('--debug', is_flag=True, default=False,
-              help='synchronous scanning, no workers')
-@click.option('--region', multiple=True,
-              help='limit scanning to specified regions')
-def run(config, tag, bucket, account, not_bucket, not_account, debug, region):
+@click.option('--account', '-a', help='scan only the given accounts', multiple=True)
+@click.option('--bucket', '-b', help='scan only the given buckets', multiple=True)
+@click.option('--not-account', help='exclude the given accounts from scan', multiple=True)
+@click.option('--not-bucket', help='exclude the given buckets from scan', multiple=True)
+@click.option('--debug', is_flag=True, default=False, help='synchronous scanning, no workers')
+@click.option('--dev', is_flag=True, default=False, help='Start in development mode.')
+@click.option('--region', multiple=True, help='limit scanning to specified regions')
+def run(config, tag, bucket, account, not_bucket, not_account, debug, region, dev):
     """Run across a set of accounts and buckets."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s: %(name)s:%(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s: %(name)s:%(levelname)s %(message)s")
     logging.getLogger('botocore').setLevel(level=logging.WARNING)
-
+    
+    appConfig.debug = debug
+    appConfig.devMode = dev
     if debug:
         def invoke(f, *args, **kw):
-            # if f.func_name == 'process_keyset':
-            #    key_count = len(args[-1])
-            #    print("debug skip keyset %d" % key_count)
-            #    return
             return f(*args, **kw)
         worker.invoke = invoke
 
     with open(config) as fh:
-        data = utils.yaml_load(fh.read())
-        for account_info in data.get('accounts', ()):
+        configFile = utils.yaml_load(fh.read())
+        appConfig.config.update(configFile)
+        for account_info in configFile.get('accounts', ()):
             if tag and tag not in account_info.get('tags', ()):
                 continue
             if account and account_info['name'] not in account:
                 continue
             if not_account and account_info['name'] in not_account:
                 continue
-            if 'inventory' in data and 'inventory' not in account_info:
-                account_info['inventory'] = data['inventory']
-            if 'visitors' in data and 'visitors' not in account_info:
-                account_info['visitors'] = data['visitors']
-            if 'object-reporting' in data and 'object-reporting' not in account_info:
-                account_info['object-reporting'] = data['object-reporting']
+            if 'inventory' in configFile and 'inventory' not in account_info:
+                account_info['inventory'] = configFile['inventory']
+            if 'visitors' in configFile and 'visitors' not in account_info:
+                account_info['visitors'] = configFile['visitors']
+            if 'object-reporting' in configFile and 'object-reporting' not in account_info:
+                account_info['object-reporting'] = configFile['object-reporting']
                 account_info['object-reporting'][
                     'record-prefix'] = datetime.utcnow().strftime('%Y/%m/%d')
             if bucket:
@@ -232,7 +272,9 @@ def run(config, tag, bucket, account, not_bucket, not_account, debug, region):
             except Exception:
                 if not debug:
                     raise
-                import pdb, traceback, sys
+                import pdb
+                import traceback
+                import sys
                 traceback.print_exc()
                 pdb.post_mortem(sys.exc_info()[-1])
                 raise
@@ -248,10 +290,8 @@ def save(dbpath):
 
 
 @cli.command()
-# todo check redis version if >=4 support this
-# @click.option('--async/--sync', default=False)
-def reset(c7n_async=None):
-    """Delete all persistent cluster state.
+def reset():
+    """Delete all persistent cluster state. Redis
     """
     click.echo('Delete db? Are you Sure? [yn] ', nl=False)
     c = click.getchar()
@@ -276,13 +316,13 @@ def workers():
     pprint.pprint(dict(counter))
 
 
-def format_accounts_csv(accounts, fh):
+def format_accounts_csv(acounts, fh):
     field_names = ['name', 'matched', 'percent_scanned', 'scanned',
                    'size', 'bucket_count']
 
     totals = Counter()
     skip = set(('name', 'percent_scanned'))
-    for a in accounts:
+    for a in acounts:
         for n in field_names:
             if n in skip:
                 continue
@@ -293,12 +333,12 @@ def format_accounts_csv(accounts, fh):
     writer.writerow(dict(zip(field_names, field_names)))
     writer.writerow(totals)
 
-    for a in accounts:
+    for a in acounts:
         ad = {n: getattr(a, n) for n in field_names}
         writer.writerow(ad)
 
 
-def format_accounts_plain(accounts, fh):
+def format_accounts_plain(acounts):
     def _repr(a):
         return "name:%s, matched:%d percent:%0.2f scanned:%d size:%d buckets:%d" % (
             a.name,
@@ -308,54 +348,43 @@ def format_accounts_plain(accounts, fh):
             a.size,
             len(a.buckets))
 
-    for a in accounts:
+    for a in acounts:
         click.echo(_repr(a))
 
 
 @cli.command()
 @click.option('--dbpath', '-f', help='json stats db')
-@click.option('--output', '-o', type=click.File('wb'), default='-',
-              help="file to to output to (default stdout)")
-@click.option('--format', help="format for output",
-              type=click.Choice(['plain', 'csv']), default='plain')
-@click.option('--account', '-a',
-              help="stats on a particular account", multiple=True)
-@click.option('--config', '-c',
-              help="config file for accounts")
+@click.option('--output', '-o', type=click.File('wb'), default='-', help="file to to output to (default stdout)")
+@click.option('--formatType', help="format for output", type=click.Choice(['plain', 'csv']), default='plain')
+@click.option('--account', '-a', help="stats on a particular account", multiple=True)
+@click.option('--config', '-c', help="config file for accounts")
 @click.option('--tag', help="filter tags by account")
 @click.option('--tagprefix', help="group accounts by tag prefix")
-@click.option('--region', '-r',
-              help="only consider buckets from the given region",
-              multiple=True)
-@click.option('--not-region',
-              help="only consider buckets not from the given region",
-              multiple=True)
-@click.option('--not-bucket',
-              help="Exclude bucket", multiple=True)
-def accounts(dbpath, output, format, account,
+@click.option('--region', '-r', help="only consider buckets from the given region", multiple=True)
+@click.option('--not-region', help="only consider buckets not from the given region", multiple=True)
+@click.option('--not-bucket', help="Exclude bucket", multiple=True)
+def accounts(dbpath, output, formatType, account,
              config=None, tag=None, tagprefix=None, region=(),
              not_region=(), not_bucket=None):
     """Report on stats by account"""
     d = db.db(dbpath)
-    accounts = d.accounts()
-    formatter = (
-        format == 'csv' and format_accounts_csv or format_accounts_plain)
-
+    acounts = d.accounts()
+    formatter = format_accounts_csv if formatType == 'csv' else format_accounts_plain
     if region:
-        for a in accounts:
+        for a in acounts:
             a.buckets = [b for b in a.buckets if b.region in region]
-        accounts = [a for a in accounts if a.bucket_count]
+        acounts = [a for a in acounts if a.bucket_count]
 
     if not_region:
-        for a in accounts:
+        for a in acounts:
             a.buckets = [b for b in a.buckets if b.region not in not_region]
-        accounts = [a for a in accounts if a.bucket_count]
+        acounts = [a for a in acounts if a.bucket_count]
 
     if not_bucket:
-        for a in accounts:
+        for a in acounts:
             a.buckets = [b for b in a.buckets if b.name not in not_bucket]
     if config and tagprefix:
-        account_map = {account.name: account for account in accounts}
+        account_map = {account.name: account for account in acounts}
 
         with open(config) as fh:
             account_data = json.load(fh).get('accounts')
@@ -377,12 +406,12 @@ def accounts(dbpath, output, format, account,
                         continue
                     tag_groups[tvalue].buckets.extend(
                         account_map[a['name']].buckets)
-        accounts = tag_groups.values()
+        acounts = tag_groups.values()
 
-    formatter(accounts, output)
+    formatter(acounts, output)
 
 
-def format_plain(buckets, fh, keys=(), explicit_only=False):
+def format_plain(bucketsList, keys=(), explicit_only=False):
     field_names = [
         'account', 'name', 'region', 'percent_scanned', 'matched',
         'scanned', 'size', 'keys_denied', 'error_count', 'partitions', 'inventory']
@@ -398,12 +427,12 @@ def format_plain(buckets, fh, keys=(), explicit_only=False):
 
     click.echo(
         tabulate.tabulate(
-            map(_repr, buckets),
+            map(_repr, bucketsList),
             headers=keys,
             tablefmt='plain'))
 
 
-def format_csv(buckets, fh, keys=()):
+def format_csv(bucketsList, fh, keys=()):
     field_names = ['account', 'name', 'region', 'created', 'matched', 'scanned',
                    'size', 'keys_denied', 'error_count', 'partitions', 'inventory']
     for k in keys:
@@ -413,7 +442,7 @@ def format_csv(buckets, fh, keys=()):
     skip = set(('account', 'name', 'region', 'percent', 'created', 'inventory'))
     skip.update(keys)
 
-    for b in buckets:
+    for b in bucketsList:
         for n in field_names:
             if n in skip:
                 continue
@@ -425,7 +454,7 @@ def format_csv(buckets, fh, keys=()):
     writer.writerow(dict(zip(field_names, field_names)))
     writer.writerow(totals)
 
-    for b in buckets:
+    for b in bucketsList:
         bd = {n: getattr(b, n) for n in field_names}
         writer.writerow(bd)
 
@@ -434,7 +463,7 @@ def format_csv(buckets, fh, keys=()):
 @click.option('--dbpath', '-f', help="json stats db")
 @click.option('--output', '-o', type=click.File('wb'), default='-',
               help="file to to output to (default stdout)")
-@click.option('--format', help="format for output",
+@click.option('--formatType', help="format for output",
               type=click.Choice(['plain', 'csv']), default='plain')
 @click.option('--bucket', '-b',
               help="stats on a particular bucket", multiple=True)
@@ -469,7 +498,7 @@ def format_csv(buckets, fh, keys=()):
               help="Exclude bucket", multiple=True)
 def buckets(bucket=None, account=None, matched=False, kdenied=False,
             errors=False, dbpath=None, size=None, denied=False,
-            format=None, incomplete=False, oversize=False, region=(),
+            formatType=None, incomplete=False, oversize=False, region=(),
             not_region=(), inventory=None, output=None, config=None, sort=None,
             tagprefix=None, not_bucket=None):
     """Report on stats by bucket"""
@@ -489,7 +518,7 @@ def buckets(bucket=None, account=None, matched=False, kdenied=False,
                     if t.startswith(tagprefix):
                         account_data[a['name']] = t[len(tagprefix):]
 
-    buckets = []
+    bucketsList = []
     for b in sorted(d.buckets(account),
                     key=operator.attrgetter('bucket_id')):
         if bucket and b.name not in bucket:
@@ -518,14 +547,14 @@ def buckets(bucket=None, account=None, matched=False, kdenied=False,
             continue
         if tagprefix:
             setattr(b, tagprefix[:-1], account_data[b.account])
-        buckets.append(b)
+        bucketsList.append(b)
 
     if sort:
         key = operator.attrgetter(sort)
-        buckets = list(reversed(sorted(buckets, key=key)))
-    formatter = format == 'csv' and format_csv or format_plain
-    keys = tagprefix and (tagprefix[:-1],) or ()
-    formatter(buckets, output, keys=keys)
+        bucketsList = list(reversed(sorted(bucketsList, key=key)))
+    formatter = format_csv if formatType == 'csv' else format_plain
+    keys = (tagprefix[:-1], ) if tagprefix else ()
+    formatter(bucketsList, output, keys=keys)
 
 
 @cli.command(name="watch")
@@ -577,7 +606,7 @@ def watch(limit):
 
         progress.insert(0, Bag(totals))
         format_plain(
-            progress, None,
+            progress,
             explicit_only=True,
             keys=['bucket_id', 'scanned', 'gkrate', 'lrate', 'krate'])
 
@@ -604,6 +633,7 @@ def inspect_partitions(bucket):
     state = db.db()
     # add db.bucket accessor
     found = None
+    b = None
     for b in state.buckets():
         if b.name == bucket:
             found = b
@@ -691,7 +721,7 @@ def inspect_queue(queue, state, limit, bucket):
     conn = worker.connection
 
     def job_row(j):
-        if isinstance(j.args[0], basestring):
+        if isinstance(j.args[0], string_types):
             account, bucket = j.args[0].split(':', 1)
         elif isinstance(j.args[0], dict):
             account, bucket = j.args[0]['name'], "set %d" % len(j.args[1])

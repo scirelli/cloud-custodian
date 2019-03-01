@@ -29,7 +29,7 @@ class Database(object):
         else:
             self.data = get_data()
 
-    def accounts(self, accounts=()):
+    def accounts(self):
         accounts = {}
         for k in self.data['bucket-size'].keys():
             a, b = k.split(':')
@@ -69,23 +69,33 @@ class Account(object):
 
     @property
     def size(self):
-        return sum([b.size for b in self.buckets])
+        if self.buckets:
+            return sum([b.size for b in self.buckets])
+        return 0
 
     @property
     def matched(self):
-        return sum([b.matched for b in self.buckets])
+        if self.buckets:
+            return sum([b.matched for b in self.buckets])
+        return 0
 
     @property
     def keys_denied(self):
-        return sum([b.keys_denied for b in self.buckets])
+        if self.buckets:
+            return sum([b.keys_denied for b in self.buckets])
+        return 0
 
     @property
     def scanned(self):
-        return sum([b.scanned for b in self.buckets])
+        if self.buckets:
+            return sum([b.scanned for b in self.buckets])
+        return 0
 
     @property
     def bucket_count(self):
-        return len(self.buckets)
+        if self.buckets:
+            return len(self.buckets)
+        return 0
 
     @property
     def percent_scanned(self):
@@ -112,28 +122,40 @@ class Bucket(object):
     @property
     def using_inventory(self):
         # boolean
-        return bool(self.data['buckets-inventory'].get(self.bucket_id))
+        if 'buckets-inventory' in self.data:
+            return bool(self.data['buckets-inventory'].get(self.bucket_id))
+        return False
 
     @property
     def inventory(self):
         # formatted...
-        return bool(self.data['buckets-inventory'].get(self.bucket_id)) and 'yes' or 'no'
+        if 'buckets-inventory' in self.data:
+            return 'yes' if bool(self.data['buckets-inventory'].get(self.bucket_id)) else 'no'
+        return 'no'
 
     @property
     def account(self):
-        return self.bucket_id.split(':')[0]
+        if self.bucket_id:
+            return self.bucket_id.split(':')[0]
+        return None
 
     @property
     def name(self):
-        return self.bucket_id.split(":")[1]
+        if self.bucket_id and len(self.bucket_id.split(':')) > 1:
+            return self.bucket_id.split(":")[1]
+        return None
 
     @property
     def region(self):
-        return self.data['bucket-region'].get(self.bucket_id, 'unknown')
+        if 'bucket-region' in self.data:
+            return self.data['bucket-region'].get(self.bucket_id, 'unknown')
+        return 'unknown'
 
     @property
     def size(self):
-        return int(self.data['bucket-size'].get(self.bucket_id, 0.0))
+        if 'bucket-size' in self.data:
+            return int(self.data['bucket-size'].get(self.bucket_id, 0.0))
+        return 0
 
     @property
     def created(self):
@@ -144,15 +166,21 @@ class Bucket(object):
 
     @property
     def matched(self):
-        return int(self.data['keys-matched'].get(self.bucket_id, 0.0))
+        if 'keys-matched' in self.data:
+            return int(self.data['keys-matched'].get(self.bucket_id, 0.0))
+        return 0
 
     @property
     def scanned(self):
-        return int(self.data['keys-scanned'].get(self.bucket_id, 0.0))
+        if 'keys-scanned' in self.data:
+            return int(self.data['keys-scanned'].get(self.bucket_id, 0.0))
+        return 0
 
     @property
     def partition_size(self):
-        return self.size / (self.partitions or 1)
+        if self.size:
+            return self.size / (self.partitions or 1)
+        return 0
 
     @property
     def percent_scanned(self):
@@ -162,15 +190,21 @@ class Bucket(object):
 
     @property
     def started(self):
-        return self.data['bucket-start'].get(self.bucket_id, 0.0)
+        if 'bucket-start' in self.data:
+            return self.data['bucket-start'].get(self.bucket_id, 0.0)
+        return 0
 
     @property
     def partitions(self):
-        return int(self.data['bucket-partitions'].get(self.bucket_id, 0.0))
+        if 'bucket-partitions' in self.data:
+            return int(self.data['bucket-partitions'].get(self.bucket_id, 0.0))
+        return 0
 
     @property
     def keys_denied(self):
-        return int(self.data['keys-denied'].get(self.bucket_id, 0))
+        if 'keys-denied' in self.data:
+            return int(self.data['keys-denied'].get(self.bucket_id, 0))
+        return 0
 
     @property
     def denied(self):
@@ -189,10 +223,14 @@ class Bucket(object):
 
     @property
     def gkrate(self):
-        return int(self.data['gkrate'].get(self.bucket_id, 0))
+        if 'gkrate' in self.data:
+            return int(self.data['gkrate'].get(self.bucket_id, 0))
+        return 0
 
     @property
     def lrate(self):
+        if 'bucket-pages' not in self.data or 'bucket-pages-time' not in self.data:
+            return 0
         return int(
             float(self.data['bucket-pages'].get(self.bucket_id, 0)) /
             (float(
@@ -200,6 +238,8 @@ class Bucket(object):
 
     @property
     def krate(self):
+        if 'keys-count' not in self.data or 'keys-time' not in self.data:
+            return 0
         return int(
             float(self.data['keys-count'].get(self.bucket_id, 0)) /
             (float(self.data['keys-time'].get(self.bucket_id, 1)) or 1))
@@ -256,4 +296,4 @@ def agg(d):
     for k, v in d.items():
         l, _ = k.split(":")
         m[l] += int(v)
-        return m
+    return m

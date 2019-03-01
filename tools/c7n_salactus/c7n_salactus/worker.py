@@ -26,7 +26,7 @@ stats:
  - buckets-end:hash
 
  - buckets-size: hash
- - buckets-large: hash # TODO
+ - buckets-large: hash
 
  - keys-scanned:hash
  - keys-matched:hash
@@ -53,6 +53,8 @@ import threading
 import time
 from uuid import uuid4
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import redis
 from rq.decorators import job
 # for bulk invoke impl
@@ -61,10 +63,7 @@ from rq.job import JobStatus, Job
 
 import boto3
 from botocore.client import Config
-from botocore.exceptions import (
-    ClientError, ConnectionError, EndpointConnectionError)
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from botocore.exceptions import (ClientError, ConnectionError, EndpointConnectionError)
 
 from c7n.credentials import assumed_session
 from c7n.resources.s3 import EncryptExtantKeys
@@ -73,13 +72,19 @@ from c7n.utils import chunks, dumps
 from c7n_salactus.objectacl import ObjectAclCheck
 from c7n_salactus.inventory import load_bucket_inventory, get_bucket_inventory
 
+try:
+    from c7n_salactus.classify import ObjectContentClassify
+except ImportError as exc:
+    sys.stderr.write("Error: failed to import settings module ({})".format(exc))
+    ObjectContentClassify = None
+
 
 def patch_ssl():
     if getattr(CONN_CACHE, 'patched', None):
         return
     from botocore.vendored import requests
     # Pick a preferred cipher suite, needs some benchmarking.
-    # https://www.slideshare.net/AmazonWebServices/maximizing-amazon-s3-performance-stg304-aws-reinvent-2013
+    # https://goo.gl/groHHe
     requests.packages.urllib3.util.ssl_.DEFAULT_CIPHERS = ':AES128-GCM-SHA256'
     try:
         setattr(requests.packages.urllib3.contrib.pyopenssl,
@@ -93,12 +98,13 @@ def patch_ssl():
 
 # We use a connection cache for sts role assumption
 CONN_CACHE = threading.local()
-
 SESSION_NAME = os.environ.get("SALACTUS_NAME", "s3-salactus")
-REDIS_HOST = os.environ["SALACTUS_REDIS"]
+REDIS_HOST = os.environ.get("SALACTUS_REDIS", '')
 
 # Minimum size of the bucket before partitioning
 PARTITION_BUCKET_SIZE_THRESHOLD = 100000
+# Default size of the bucket before checking for inventory
+DEFAULT_INVENTORY_BUCKET_SIZE_THRESHOLD = int(os.environ.get("SALACTUS_INVENTORY_THRESHOLD", 100000))
 
 # Page size for keys found during partition
 PARTITION_KEYSET_THRESHOLD = 500
@@ -106,20 +112,19 @@ PARTITION_KEYSET_THRESHOLD = 500
 # Length of partition queue before going parallel
 PARTITION_QUEUE_THRESHOLD = 6
 
-DEFAULT_TTL = 60 * 60 * 48
-
-# Default size of the bucket before checking for inventory
-DEFAULT_INVENTORY_BUCKET_SIZE_THRESHOLD = \
-    int(os.environ.get("SALACTUS_INVENTORY_THRESHOLD", 100000))
+TWO_DAYS = 60 * 60 * 48
+DEFAULT_TTL = TWO_DAYS
 
 BUCKET_OBJ_DESC = {
-    True: ('Versions', 'list_object_versions',
-           ('NextKeyMarker', 'NextVersionIdMarker')),
-    False: ('Contents', 'list_objects_v2',
-            ('NextContinuationToken',))
+    True: ('Versions', 'list_object_versions', ('NextKeyMarker', 'NextVersionIdMarker')),
+    False: ('Contents', 'list_objects_v2', ('NextContinuationToken',))
 }
 
-connection = redis.Redis(host=REDIS_HOST)
+MAX_WORKER_THREADS = 10
+WORKER_MAX_KEYS_PER_PAGE = 100
+WORKER_THREAD_KEY_CHUNK_SIZE = 10
+
+connection = redis.Redis(host=REDIS_HOST, decode_responses=True)
 # Increase timeouts to assist with non local regions, also
 # seeing some odd net slowness all around.
 s3config = Config(read_timeout=420, connect_timeout=90)
@@ -187,7 +192,7 @@ def bulk_invoke(func, args, nargs):
         with connection.pipeline() as pipe:
             for s in n:
                 argv[-1] = s
-                job._id = unicode(uuid4())
+                job._id = str(uuid4())
                 job.args = argv
                 q.enqueue_job(job, pipeline=pipe)
             pipe.execute()
@@ -200,7 +205,7 @@ def bucket_ops(bid, api=""):
     bid: bucket_id in form of account_name:bucket_name
     """
     try:
-        yield 42
+        yield bid
     except ClientError as e:
         code = e.response['Error']['Code']
         log.info(
@@ -212,28 +217,23 @@ def bucket_ops(bid, api=""):
         elif code == 'AccessDenied':
             connection.sadd('buckets-denied', bid)
         else:
-            connection.hset(
-                'buckets-unknown-errors',
-                bid,
-                "%s:%s" % (api, e.response['Error']['Code']))
+            connection.hset('buckets-unknown-errors', bid, "%s:%s" % (api, e.response['Error']['Code']))
     except Exception as e:
-        connection.hset(
-            'buckets-unknown-errors',
-            bid,
-            "%s:%s" % (api, str(e)))
+        connection.hset('buckets-unknown-errors', bid, "%s:%s" % (api, str(e)))
         # Let the error queue catch it
         raise
 
 
 def page_strip(page, versioned):
-    """Remove bits in content results to minimize memory utilization.
+    """
+    Remove bits in content results to minimize memory utilization.
+    Returns a list of keys from the paged results.
 
     TODO: evolve this to a key filter on metadata, like date
-
     """
     # page strip filtering should be conditional
     page.pop('ResponseMetadata', None)
-    contents_key = versioned and 'Versions' or 'Contents'
+    contents_key = 'Versions' if versioned else 'Contents'
     contents = page.get(contents_key, ())
 
     # aggressive size
@@ -245,24 +245,12 @@ def page_strip(page, versioned):
             else:
                 keys.append((k['Key'], k['VersionId']))
         return keys
-    else:
-        return [k['Key'] for k in contents]
 
-    if not contents:
-        return page
-
-    # Depending on use case we may want these
-    for k in contents:
-        k.pop('Owner', None)
-        k.pop('LastModified', None)
-        k.pop('ETag', None)
-        k.pop('StorageClass', None)
-        k.pop('Size', None)
-
-    return page
+    return [k['Key'] for k in contents]
 
 
-def bucket_key_count(client, bucket):
+def bucket_key_count(cloudwatch_client, bucket):
+    TWENTY_FOUR_HOURS_IN_SECONDS = 60 * 60 * 24
     params = dict(
         Namespace='AWS/S3',
         MetricName='NumberOfObjects',
@@ -271,13 +259,12 @@ def bucket_key_count(client, bucket):
              'Value': bucket['name']},
             {'Name': 'StorageType',
              'Value': 'AllStorageTypes'}],
-        StartTime=datetime.now().replace(
-            hour=0, minute=0, second=0, microsecond=0) - timedelta(1),
-        EndTime=datetime.now().replace(
-            hour=0, minute=0, second=0, microsecond=0),
-        Period=60 * 60 * 24,
+        StartTime=datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1),
+        EndTime=datetime.now().replace(hour=0, minute=0, second=0, microsecond=0),
+        Period=TWENTY_FOUR_HOURS_IN_SECONDS,
         Statistics=['Minimum'])
-    response = client.get_metric_statistics(**params)
+
+    response = cloudwatch_client.get_metric_statistics(**params)
     if not response['Datapoints']:
         return 0
     return response['Datapoints'][0]['Minimum']
@@ -292,27 +279,36 @@ def process_account(account_info):
     client = session.client('s3', config=s3config)
     buckets = client.list_buckets()['Buckets']
 
-    connection.hset(
-        'bucket-accounts', account_info['name'], json.dumps(account_info))
+    connection.hset('bucket-accounts', account_info['name'], json.dumps(account_info))
 
     for b in buckets:
-        connection.hset(
-            'bucket-ages', bucket_id(account_info, b['Name']),
-            b['CreationDate'].isoformat())
+        connection.hset('bucket-ages', bucket_id(account_info, b['Name']), b['CreationDate'].isoformat())
 
     account_buckets = account_info.pop('buckets', None)
-    buckets = [n['Name'] for n in buckets
-               if not account_buckets or
-               n['Name'] in account_buckets]
+    buckets = [n['Name'] for n in buckets if not account_buckets or n['Name'] in account_buckets]
     account_not_buckets = account_info.pop('not-buckets', None)
     buckets = [n for n in buckets
-               if not account_not_buckets or
-               n not in account_not_buckets]
+               if not account_not_buckets
+               or n not in account_not_buckets]
     log.info("processing %d buckets in account %s",
              len(buckets), account_info['name'])
     for bucket_set in chunks(buckets, 50):
         invoke(process_bucket_set, account_info, bucket_set)
 
+def normalize_bucket_location(location):
+    """
+    Normalizes locations returned from AWS. If 'EU' is returned as the bucket location this function with return 'eu-west-1'
+    """
+    region = ''
+
+    if location is None:
+        region = "us-east-1"
+    elif location == 'EU':
+        region = "eu-west-1"
+    else:
+        region = location
+
+    return region
 
 @job('bucket-set', timeout=3600, connection=connection)
 def process_bucket_set(account_info, buckets):
@@ -325,89 +321,73 @@ def process_bucket_set(account_info, buckets):
     log = logging.getLogger('salactus.bucket-set')
     log.info("processing account %s", account_info)
     session = get_session(account_info)
-    client = session.client('s3', config=s3config)
+    s3_client = session.client('s3', config=s3config)
 
-    for b in buckets:
-        bid = bucket_id(account_info, b)
-        with bucket_ops(bid):
-            info = {'name': b}
+    for bucket in buckets:
+        with bucket_ops(bucket_id(account_info, bucket)) as bucketId:
+            info = {'name': bucket}
             error = None
 
             try:
-                location = client.get_bucket_location(
-                    Bucket=b).get('LocationConstraint')
+                location = s3_client.get_bucket_location(Bucket=bucket).get('LocationConstraint')
             except Exception as e:
                 error = e
                 location = None
 
-            if location is None:
-                region = "us-east-1"
-            elif location == 'EU':
-                region = "eu-west-1"
-            else:
-                region = location
+            region = normalize_bucket_location(location)
 
-            if (account_info.get('regions', ()) and
-                    region not in account_info.get('regions', ())):
+            if (account_info.get('regions', ()) and region not in account_info.get('regions', ())):
                 continue
 
             info['region'] = region
             if region not in region_clients:
                 region_clients.setdefault(region, {})
-                region_clients[region]['s3'] = s3 = session.client(
-                    's3', region_name=region, config=s3config)
-                region_clients[region]['cloudwatch'] = cw = session.client(
-                    'cloudwatch', region_name=region, config=s3config)
+                region_clients[region]['s3'] = s3_client = session.client('s3', region_name=region, config=s3config)
+                region_clients[region]['cloudwatch'] = cloudwatch_client = session.client('cloudwatch', region_name=region, config=s3config)
             else:
-                s3 = region_clients[region]['s3']
-                cw = region_clients[region]['cloudwatch']
+                s3_client = region_clients[region]['s3']
+                cloudwatch_client = region_clients[region]['cloudwatch']
 
             try:
-                info['keycount'] = bucket_key_count(cw, info)
+                info['keycount'] = bucket_key_count(cloudwatch_client, info)
             except Exception:
                 raise
             else:
-                connection.hset('bucket-sizes', bid, info['keycount'])
+                connection.hset('bucket-sizes', bucketId, info['keycount'])
 
             if error:
                 raise error
 
-            connection.hset('bucket-regions', bid, region)
+            connection.hset('bucket-regions', bucketId, region)
 
-            versioning = s3.get_bucket_versioning(Bucket=b)
-            info['versioned'] = (
-                versioning and versioning.get('Status', '')
-                in ('Enabled', 'Suspended') or False)
-            connection.hset('bucket-versions', bid, int(info['versioned']))
+            versioning = s3_client.get_bucket_versioning(Bucket=bucket)
+            info['versioned'] = (versioning.get('Status', '') in ('Enabled', 'Suspended') if versioning else False)
+            connection.hset('bucket-versions', bucketId, int(info['versioned']))
 
             log.info("processing bucket %s", info)
-            connection.hset('bucket-starts', bid, time.time())
-            dispatch_object_source(s3, account_info, bid, info)
+            connection.hset('bucket-starts', bucketId, time.time())
+            dispatch_object_source(s3_client, account_info, bucketId, info)
 
 
-def dispatch_object_source(client, account_info, bid, bucket_info):
-    """Select and dispatch an object source for a bucket.
+def dispatch_object_source(s3_client, account_info, bucket_id, bucket_info):
+    """
+    Select and dispatch an object source for a bucket.
 
     Choices are bucket partition, inventory, or direct pagination.
     """
 
-    if (account_info.get('inventory') and
-        bucket_info['keycount'] >
-            account_info['inventory'].get('bucket-size-threshold',
-                                          DEFAULT_INVENTORY_BUCKET_SIZE_THRESHOLD)):
-        inventory_info = get_bucket_inventory(
-            client,
-            bucket_info['name'],
-            account_info['inventory'].get('id-selector', '*'))
+    if (
+            account_info.get('inventory')
+            and bucket_info['keycount'] > account_info['inventory'].get('bucket-size-threshold', DEFAULT_INVENTORY_BUCKET_SIZE_THRESHOLD)
+       ):
+        inventory_info = get_bucket_inventory(s3_client, bucket_info['name'], account_info['inventory'].get('id-selector', '*'))
         if inventory_info is not None:
-            return invoke(
-                process_bucket_inventory, bid,
-                inventory_info['bucket'], inventory_info['prefix'])
+            return invoke(process_bucket_inventory, bucket_id, inventory_info['bucket'], inventory_info['prefix'])
 
     if bucket_info['keycount'] > PARTITION_BUCKET_SIZE_THRESHOLD:
-        invoke(process_bucket_partitions, bid)
-    else:
-        invoke(process_bucket_iterator, bid)
+        return invoke(process_bucket_partitions, bucket_id)
+
+    return invoke(process_bucket_iterator, bucket_id)
 
 
 class CharSet(object):
@@ -534,9 +514,7 @@ def get_keys_charset(keys, bid):
             break
 
     if charset is None:
-        raise ValueError(
-            "Bucket: %s Failed charset ngram detection %r\n%s" % (
-                bid, "".join(chars)), "\n".join(sorted(keys)))
+        raise ValueError("Bucket: %s Failed charset ngram detection %r\n%s" % (bid, "".join(chars)), "\n".join(sorted(keys)))
 
     for n, sset in normalized.items():
         charset = charset.symmetric_difference(sset)
@@ -553,8 +531,7 @@ def detect_partition_strategy(bid, delimiters=('/', '-'), prefix=''):
     region = connection.hget('bucket-regions', bid)
     versioned = bool(int(connection.hget('bucket-versions', bid)))
     size = int(float(connection.hget('bucket-sizes', bid)))
-    session = get_session(
-        json.loads(connection.hget('bucket-accounts', account)))
+    session = get_session(json.loads(connection.hget('bucket-accounts', account)))
     s3 = session.client('s3', region_name=region, config=s3config)
 
     (contents_key,
@@ -565,37 +542,30 @@ def detect_partition_strategy(bid, delimiters=('/', '-'), prefix=''):
         keys = set()
         for delimiter in delimiters:
             method = getattr(s3, contents_method, None)
-            results = method(
-                Bucket=bucket, Prefix=prefix, Delimiter=delimiter)
+            results = method(Bucket=bucket, Prefix=prefix, Delimiter=delimiter)
             prefixes = [p['Prefix'] for p in results.get('CommonPrefixes', [])]
             contents = results.get(contents_key, [])
             keys.update([k['Key'] for k in contents])
             # If we have common prefixes within limit thresholds go wide
-            if (len(prefixes) > 0 and
-                len(prefixes) < 1000 and
-                    len(contents) < 1000):
-                log.info(
-                    "%s detected prefix delimiter:%s contents:%d prefixes:%d",
-                    bid, delimiter, len(contents), len(prefixes))
-                limit = prefix and 2 or 4
-                return process_bucket_partitions(
-                    bid, partition=delimiter,
-                    strategy='p', prefix_set=prefixes, limit=limit)
+            if (prefixes and len(prefixes) < 1000 and len(contents) < 1000):
+                log.info("%s detected prefix delimiter:%s contents:%d prefixes:%d",
+                         bid, delimiter, len(contents), len(prefixes))
+                limit = 2 if prefix else 4
+                return process_bucket_partitions(bid, partition=delimiter, strategy='p', prefix_set=prefixes, limit=limit)
 
     # Detect character sets
     charset = get_keys_charset(keys, bid)
     log.info("Detected charset %s for %s", charset, bid)
 
     # Determine the depth we need to keep total api calls below threshold
-    scan_count = size / 1000.0
+    scan_count = size / 1000.0 #page_count?
     for limit in range(1, 4):
         if math.pow(len(charset), limit) * 1000 > scan_count:
             break
 
     # Dispatch
     prefixes = ('',)
-    prefixes = NGramPartition(
-        charset, limit=limit).initialize_prefixes(prefixes)
+    prefixes = NGramPartition(charset, limit=limit).initialize_prefixes(prefixes)
 
     #
     random.shuffle(prefixes)
@@ -604,15 +574,13 @@ def detect_partition_strategy(bid, delimiters=('/', '-'), prefix=''):
     # todo carry charset forward as param, and go incremental on prefix
     # ngram expansion
     connection.hincrby('bucket-partition', bid, len(prefixes))
-    return bulk_invoke(
-        process_bucket_iterator, [bid], prefixes)
+    return bulk_invoke(process_bucket_iterator, [bid], prefixes)
 
 
-@job('bucket-partition', timeout=3600 * 4, ttl=DEFAULT_TTL,
-     connection=connection, result_ttl=0)
-def process_bucket_partitions(
-        bid, prefix_set=('',), partition='/', strategy=None, limit=4):
-    """Split up a bucket keyspace into smaller sets for parallel iteration.
+@job('bucket-partition', timeout=3600 * 4, ttl=DEFAULT_TTL, connection=connection, result_ttl=0)
+def process_bucket_partitions(bid, prefix_set=('',), partition='/', strategy=None, limit=4):
+    """
+    Split up a bucket keyspace into smaller sets for parallel iteration.
     """
     if strategy is None:
         return detect_partition_strategy(bid)
@@ -620,8 +588,7 @@ def process_bucket_partitions(
     account, bucket = bid.split(':', 1)
     region = connection.hget('bucket-regions', bid)
     versioned = bool(int(connection.hget('bucket-versions', bid)))
-    session = get_session(
-        json.loads(connection.hget('bucket-accounts', account)))
+    session = get_session(json.loads(connection.hget('bucket-accounts', account)))
     size = int(float(connection.hget('bucket-sizes', bid)))
     s3 = session.client('s3', region_name=region, config=s3config)
 
@@ -634,14 +601,10 @@ def process_bucket_partitions(
     prefix_queue = strategy.initialize_prefixes(prefix_set)
 
     keyset = []
-    log.info(
-        "Process partition bid:%s strategy:%s delimiter:%s queue:%d limit:%d",
-        bid, strategy.__class__.__name__[0], partition,
-        len(prefix_queue), limit)
+    log.info("Process partition bid:%s strategy:%s delimiter:%s queue:%d limit:%d", bid, strategy.__class__.__name__[0], partition, len(prefix_queue), limit)
 
     def statm(prefix):
-        return "keyset:%d queue:%d prefix:%s bucket:%s size:%d" % (
-            len(keyset), len(prefix_queue), prefix, bid, size)
+        return "keyset:%d queue:%d prefix:%s bucket:%s size:%d" % (len(keyset), len(prefix_queue), prefix, bid, size)
 
     while prefix_queue:
         connection.hincrby('bucket-partition', bid, 1)
@@ -703,10 +666,10 @@ def process_bucket_partitions(
             invoke(process_keyset, bid, page)
 
 
-@job('bucket-inventory', timeout=DEFAULT_TTL, ttl=DEFAULT_TTL,
-     connection=connection, result_ttl=0)
+@job('bucket-inventory', timeout=DEFAULT_TTL, ttl=DEFAULT_TTL, connection=connection, result_ttl=0)
 def process_bucket_inventory(bid, inventory_bucket, inventory_prefix):
-    """Load last inventory dump and feed as key source.
+    """
+    Load last inventory dump and feed as key source.
     """
     log.info("Loading bucket %s keys from inventory s3://%s/%s",
              bid, inventory_bucket, inventory_prefix)
@@ -716,10 +679,9 @@ def process_bucket_inventory(bid, inventory_bucket, inventory_prefix):
     session = boto3.Session()
     s3 = session.client('s3', region_name=region, config=s3config)
 
-    # find any key visitors with inventory filtering
+    # find any account inventory filtering.
     account_info = json.loads(connection.hget('bucket-accounts', account))
-    ifilters = [v.inventory_filter for v
-                in get_key_visitors(account_info) if v.inventory_filter]
+    ifilters = account_info.get('inventory', {}).get('object-filters', {})
 
     with bucket_ops(bid, 'inventory'):
         page_iterator = load_bucket_inventory(
@@ -735,19 +697,17 @@ def process_bucket_inventory(bid, inventory_bucket, inventory_prefix):
             invoke(process_keyset, bid, page)
 
 
-@job('bucket-page-iterator', timeout=DEFAULT_TTL, ttl=DEFAULT_TTL,
-     connection=connection, result_ttl=0)
+@job('bucket-page-iterator', timeout=DEFAULT_TTL, ttl=DEFAULT_TTL, connection=connection, result_ttl=0)
 def process_bucket_iterator(bid, prefix="", delimiter="", **continuation):
-    """Bucket pagination
     """
-    log.info("Iterating keys bucket %s prefix %s delimiter %s",
-             bid, prefix, delimiter)
+    Bucket pagination
+    """
+    log.info("Iterating keys bucket %s prefix %s delimiter %s", bid, prefix, delimiter)
 
     account, bucket = bid.split(':', 1)
     region = connection.hget('bucket-regions', bid)
     versioned = bool(int(connection.hget('bucket-versions', bid)))
-    session = get_session(
-        json.loads(connection.hget('bucket-accounts', account)))
+    session = get_session(json.loads(connection.hget('bucket-accounts', account)))
     s3 = session.client('s3', region_name=region, config=s3config)
 
     (contents_key, contents_method, _) = BUCKET_OBJ_DESC[versioned]
@@ -761,27 +721,29 @@ def process_bucket_iterator(bid, prefix="", delimiter="", **continuation):
         params.update({k[4:]: v for k, v in continuation.items()})
     paginator = s3.get_paginator(contents_method).paginate(**params)
     with bucket_ops(bid, 'page'):
-        ptime = time.time()
-        pcounter = 0
+        page_start_time = time.time()
+        page_counter = 0
         for page in paginator:
-            page = page_strip(page, versioned)
-            pcounter += 1
-            if page:
-                invoke(process_keyset, bid, page)
+            page_counter += 1
 
-            if pcounter % 10 == 0:
+            page = page_strip(page, versioned)
+            for worker_page_chunk in chunks(page, WORKER_MAX_KEYS_PER_PAGE):
+                if worker_page_chunk:
+                    invoke(process_keyset, bid, worker_page_chunk)
+
+            if page_counter % 10 == 0:
                 with connection.pipeline() as p:
                     nptime = time.time()
                     p.hincrby('bucket-pages', bid, 1)
-                    p.hincrby('bucket-pages-time', bid, int(nptime - ptime))
-                    ptime = nptime
+                    p.hincrby('bucket-pages-time', bid, int(nptime - page_start_time))
+                    page_start_time = nptime
                     p.execute()
 
-        if pcounter % 10:
+        if page_counter % 10:
             with connection.pipeline() as p:
                 nptime = time.time()
                 p.hincrby('bucket-pages', bid, 1)
-                p.hincrby('bucket-pages-time', bid, int(nptime - ptime))
+                p.hincrby('bucket-pages-time', bid, int(nptime - page_start_time))
                 p.execute()
 
 
@@ -790,15 +752,20 @@ def get_key_visitors(account_info):
         return [EncryptExtantKeys(keyconfig)]
     visitors = []
     for v in account_info.get('visitors'):
+        vi = None
         if v['type'] == 'encrypt-keys':
             vi = EncryptExtantKeys(v)
             vi.visitor_name = 'encrypt-keys'
             vi.inventory_filter = filter_encrypted
-            visitors.append(vi)
         elif v['type'] == 'object-acl':
             vi = ObjectAclCheck(v)
             vi.visitor_name = 'object-acl'
             vi.inventory_filter = None
+        elif v['type'] == 'classify' and ObjectContentClassify:
+            vi = ObjectContentClassify(v)
+            vi.visitor_name = 'classify'
+            vi.inventory_filter = None
+        if vi:
             visitors.append(vi)
     return visitors
 
@@ -809,14 +776,12 @@ def filter_encrypted(ischema, kr):
     return kr[ischema['EncryptionStatus']].startswith('SSE')
 
 
-@job('bucket-keyset-scan', timeout=DEFAULT_TTL, ttl=DEFAULT_TTL,
-     connection=connection, result_ttl=0)
+@job('bucket-keyset-scan', timeout=DEFAULT_TTL, ttl=DEFAULT_TTL, connection=connection, result_ttl=0)
 def process_keyset(bid, key_set):
     account, bucket = bid.split(':', 1)
     region = connection.hget('bucket-regions', bid)
     versioned = bool(int(connection.hget('bucket-versions', bid)))
     account_info = json.loads(connection.hget('bucket-accounts', account))
-
     visitors = get_key_visitors(account_info)
     object_reporting = account_info.get('object-reporting')
     session = get_session(account_info)
@@ -833,15 +798,12 @@ def process_keyset(bid, key_set):
     objects['objects_denied'] = []
 
     with bucket_ops(bid, 'key'):
-        with ThreadPoolExecutor(max_workers=10) as w:
+        with ThreadPoolExecutor(max_workers=MAX_WORKER_THREADS) as w:
             futures = {}
-            for kchunk in chunks(key_set, 100):
+            for kchunk in chunks(key_set, WORKER_THREAD_KEY_CHUNK_SIZE):
                 for v in visitors:
-                    processor = (versioned and
-                        v.process_version or v.process_key)
-                    futures[w.submit(
-                        process_key_chunk, s3, bucket, kchunk,
-                        processor, bool(object_reporting))] = v.visitor_name
+                    processor = v.process_version if versioned else v.process_key
+                    futures[w.submit(process_key_chunk, s3, bucket, kchunk, processor, bool(object_reporting))] = v.visitor_name
 
             for f in as_completed(futures):
                 if f.exception():
@@ -907,6 +869,7 @@ def process_key_chunk(s3, bucket, kchunk, processor, object_reporting):
             k = {'Key': k[0], 'VersionId': k[1] or 'null', 'IsLatest': False}
         else:
             k = {'Key': k[0], 'VersionId': k[1] or 'null', 'IsLatest': True}
+
         try:
             result = processor(s3, bucket_name=bucket, key=k)
         except EndpointConnectionError:
@@ -914,7 +877,7 @@ def process_key_chunk(s3, bucket, kchunk, processor, object_reporting):
         except ConnectionError:
             stats['connection'] += 1
         except ClientError as e:
-            #  https://docs.aws.amazon.com/AmazonS3/latest/API/ErrorResponses.html
+            #  https://goo.gl/HZLv9b
             code = e.response['Error']['Code']
             if code in ('403', 'AccessDenied', '405', 'MethodNotAllowed'):  # Permission Denied
                 stats['denied'] += 1
@@ -945,7 +908,6 @@ def publish_object_records(bid, objects, reporting):
             found = True
     if not found:
         return
-
     client = get_session({'name': 'object-records'}).client('s3')
     bucket = reporting.get('bucket')
     record_prefix = reporting.get('record-prefix')

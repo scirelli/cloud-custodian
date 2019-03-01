@@ -16,14 +16,15 @@ rq worker customizations
  - dont fork per job
  - use compressed msg pack messages (less mem in queue)
 """
-import datetime
-import msgpack
-import cPickle
-import logging
 
-from lz4.frame import compress, decompress
+import pickle as cPickle
+import datetime
+import logging
+import msgpack
+
 from rq.worker import Worker
 from rq import job
+from lz4.frame import compress, decompress
 
 PackDate_ExtType = 42
 PackObj_ExtType = 43
@@ -58,20 +59,19 @@ def encode_ext(obj):
 
 
 def dumps(o):
-    return compress(
-        msgpack.packb(o, default=encode_ext, use_bin_type=True))
+    return compress(msgpack.packb(o, default=encode_ext, use_bin_type=True))
 
 
 def loads(s):
     try:
         return msgpack.unpackb(
             decompress(s), ext_hook=decode_ext, encoding='utf-8')
-    except Exception:
+    except Exception: # pylint: disable=broad-except
         # we queue work occassionally from lambdas or other systems not using
         # the worker class
         return job_default_load(s)
 
-
+#Change the way Jobs are serialized. RQ default is to use cPickle https://github.com/rq/rq/blob/master/rq/job.py#L25
 job.dumps = dumps
 job.loads = loads
 
@@ -79,12 +79,12 @@ job.loads = loads
 class SalactusWorker(Worker):
     """Get rid of process boundary, maintain worker status.
 
-    We rely on supervisord for process supervision, and we want
+    We rely on supervisore for process supervision, and we want
     to be able to cache sts sessions per process to avoid role
     assume storms.
     """
 
-    def execute_job(self, job, queue):
+    def execute_job(self, job_to_execute, queue):
         self.set_state('busy')
-        self.perform_job(job, queue)
+        self.perform_job(job_to_execute, queue)
         self.set_state('idle')
